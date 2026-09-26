@@ -1,8 +1,39 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:13px}.b-pending{background:#fdf0d5;color:#8a5a00}.b-merged{background:#dff3e3;color:#1d6b33}.b-rejected{background:#fbe0e0;color:#a02020}.b-partial{background:#fde8d5;color:#8a4a00}.b-empty{background:#e8edf1;color:#5a6b7a}button{cursor:pointer;padding:3px 10px}input,select{padding:3px 6px}</style>
 <h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
 <h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
 <h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+<h2>离线回传批次</h2>
+<div class="card">回传按批次逐条回执：已成功记录重传不重复写入，被拒记录改正后重传可再合并；事件结束后只保留拒绝原因，时间线不再改动。可从拒绝记录发起复查（需 <code>coordinator</code> 或 <code>analyst</code> 角色）。
+<div style="margin-top:8px">操作人 <input id="xuser" value="coord-demo"> 角色 <select id="xrole"><option value="coordinator">coordinator</option><option value="analyst">analyst</option></select></div></div>
+<table id="batches"><thead><tr><th>批次</th><th>状态</th><th>待处理</th><th>成功</th><th>拒绝</th><th>接收时间</th><th>最近处理</th></tr></thead><tbody></tbody></table>
+<h2>待处理与拒绝回执</h2>
+<table id="receipts"><thead><tr><th>批次</th><th>记录</th><th>类型</th><th>状态</th><th>拒绝原因</th><th>复查</th></tr></thead><tbody></tbody></table>
 <h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+const B={pending:'待处理',merged:'已合并',partial:'部分合并',rejected:'已拒绝',empty:'空'};
+const R={pending:'待处理',merged:'成功',rejected:'拒绝'};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function review(id){
+  const note=prompt('复查说明（可选）：','')??'';
+  const r=await fetch('/api/offline/review',{method:'POST',headers:{'Content-Type':'application/json','X-User':document.querySelector('#xuser').value,'X-Role':document.querySelector('#xrole').value},body:JSON.stringify({record_id:id,note})});
+  const d=await r.json();
+  if(!r.ok){alert('复查失败：'+(d.error||r.status));return}
+  load();
+}
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${esc(r[c])}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('assets',d.assets,['name','kind','status','range_km']);
+  fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);
+  const batchName={};d.offline_batches.forEach(b=>batchName[b.id]=b.client_batch_id);
+  document.querySelector('#batches tbody').innerHTML=d.offline_batches.map(b=>
+    `<tr><td>${esc(b.client_batch_id)}</td><td><span class="badge b-${b.status}">${B[b.status]||esc(b.status)}</span></td><td>${b.pending}</td><td>${b.accepted}</td><td>${b.rejected}</td><td>${esc(b.received_at)}</td><td>${esc(b.merged_at)}</td></tr>`).join('');
+  document.querySelector('#receipts tbody').innerHTML=d.offline_records.filter(r=>r.status!=='merged').map(r=>
+    `<tr><td>${esc(batchName[r.batch_id]||r.batch_id)}</td><td>${esc(r.client_event_id)}</td><td>${esc(r.event_type)}</td><td><span class="badge b-${r.status}">${R[r.status]||esc(r.status)}</span></td><td>${esc(r.reason)}${r.review_note?`<br><small>复查：${esc(r.review_note)}（${esc(r.reviewed_by||'')}）</small>`:''}</td><td>${r.status==='rejected'?`<button onclick="review(${r.id})">复查</button>`:''}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${esc(x.created_at)} ${esc(x.action)} ${esc(x.details)}</li>`).join('');
+}
+load();
+</script></html>
