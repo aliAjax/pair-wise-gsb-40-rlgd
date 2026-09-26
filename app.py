@@ -153,6 +153,20 @@ class MaritimeSARService:
                     merged_at TEXT,
                     summary TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS offline_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES offline_batches(id),
+                    client_event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    record_id INTEGER,
+                    error TEXT NOT NULL DEFAULT '',
+                    review_note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(batch_id, client_event_id)
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     incident_id INTEGER REFERENCES incidents(id),
@@ -163,6 +177,8 @@ class MaritimeSARService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+                CREATE INDEX IF NOT EXISTS idx_offline_records_batch ON offline_records(batch_id, status);
+                CREATE INDEX IF NOT EXISTS idx_offline_records_event ON offline_records(client_event_id);
                 """
             )
 
@@ -479,6 +495,112 @@ class MaritimeSARService:
             self._audit(conn, incident_id, actor, "incident.closed", {"outcome": outcome})
             return dict(conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone())
 
+    def _merge_offline_event(self, conn: sqlite3.Connection, actor: str, event: dict[str, Any],
+                             event_id: str) -> tuple[str, int | None, bool]:
+        """尝试合并一条离线事件，返回 (类型, 记录ID, 是否实际写入)。校验失败抛出 DomainError。"""
+        etype = event.get("type")
+        if etype == "clue":
+            existing_clue = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
+            if existing_clue:
+                return "clue", int(existing_clue["id"]), False
+            try:
+                incident_id = int(event["incident_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DomainError("离线线索缺少有效的 incident_id") from exc
+            lat, lon = validate_position(event.get("latitude"), event.get("longitude"))
+            try:
+                confidence = float(event.get("confidence"))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("置信度必须是数值") from exc
+            if not 0 <= confidence <= 1:
+                raise DomainError("置信度应在 0 到 1 之间")
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if not incident:
+                raise DomainError("事件不存在", 404)
+            if incident["status"] in CLOSED_INCIDENT:
+                raise DomainError("已结束事件不能新增线索", 409)
+            area_id = event.get("area_id")
+            if area_id is not None and not conn.execute(
+                "SELECT 1 FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)
+            ).fetchone():
+                raise DomainError("搜索区域不属于该事件", 409)
+            distance = haversine_km(incident["latitude"], incident["longitude"], lat, lon)
+            status = "unverified" if distance <= incident["uncertainty_km"] * 3 else "invalid"
+            cur = conn.execute(
+                """INSERT INTO clues(incident_id,area_id,client_event_id,latitude,longitude,confidence,source,status,
+                   distance_from_incident_km,reporter,details,recorded_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (incident_id, area_id, event_id, lat, lon, confidence,
+                 str(event.get("source", "offline")).strip(), status, distance, actor,
+                 str(event.get("details", "")).strip(), utcnow()),
+            )
+            clue_id = int(cur.lastrowid)
+            self._audit(conn, incident_id, actor, "clue.recorded", {"clue_id": clue_id, "status": status, "event_id": event_id})
+            return "clue", clue_id, True
+        if etype == "timeline":
+            done = conn.execute(
+                "SELECT 1 FROM offline_records WHERE client_event_id=? AND event_type='timeline' AND status='merged' LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            if done:
+                return "timeline", None, False
+            try:
+                incident_id = int(event["incident_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DomainError("离线时间线缺少有效的 incident_id") from exc
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if not incident:
+                raise DomainError("事件不存在", 404)
+            if incident["status"] in CLOSED_INCIDENT:
+                raise DomainError("事件已结束，时间线不能改动", 409)
+            action = str(event.get("action") or "offline.note")
+            details = event.get("details")
+            self._audit(conn, incident_id, actor, action, details if isinstance(details, dict) else {"note": details})
+            return "timeline", None, True
+        raise DomainError("不支持的离线事件类型")
+
+    def _save_receipt(self, conn: sqlite3.Connection, batch_row_id: int, event_id: str, etype: str,
+                      event: dict[str, Any], status: str, record_id: int | None, error: str,
+                      receipt_id: int | None = None) -> int:
+        now = utcnow()
+        payload = json_dump(event)
+        if receipt_id is not None:
+            conn.execute(
+                "UPDATE offline_records SET event_type=?,payload=?,status=?,record_id=?,error=?,updated_at=? WHERE id=?",
+                (etype, payload, status, record_id, error, now, receipt_id),
+            )
+            return receipt_id
+        cur = conn.execute(
+            """INSERT INTO offline_records(batch_id,client_event_id,event_type,payload,status,record_id,error,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (batch_row_id, event_id, etype, payload, status, record_id, error, now, now),
+        )
+        return int(cur.lastrowid)
+
+    def _refresh_batch(self, conn: sqlite3.Connection, batch_row_id: int) -> tuple[str, dict[str, int], list[dict[str, Any]]]:
+        receipts = [dict(r) for r in conn.execute(
+            "SELECT * FROM offline_records WHERE batch_id=? ORDER BY id", (batch_row_id,)
+        ).fetchall()]
+        merged = sum(1 for r in receipts if r["status"] == "merged")
+        rejected = sum(1 for r in receipts if r["status"] == "rejected")
+        pending = sum(1 for r in receipts if r["status"] == "pending")
+        if not receipts:
+            status = "received"
+        elif pending:
+            status = "reviewing"
+        elif rejected and merged:
+            status = "partial"
+        elif rejected:
+            status = "rejected"
+        else:
+            status = "merged"
+        summary = {"accepted": merged, "rejected": rejected, "pending": pending}
+        conn.execute(
+            "UPDATE offline_batches SET status=?,merged_at=?,summary=? WHERE id=?",
+            (status, utcnow(), json_dump(summary), batch_row_id),
+        )
+        return status, summary, receipts
+
     def merge_offline_batch(self, actor: str, role: str, client_batch_id: str,
                             events: list[dict[str, Any]]) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -486,67 +608,126 @@ class MaritimeSARService:
         batch_id = client_batch_id.strip()
         if not batch_id or not isinstance(events, list):
             raise DomainError("批次编号和事件列表不能为空")
+        now = utcnow()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT * FROM offline_batches WHERE client_batch_id=?", (batch_id,)).fetchone()
-            if existing:
-                return {"batch_id": batch_id, "idempotent": True, "status": existing["status"], "summary": json.loads(existing["summary"])}
-            results = []
-            for event in events:
-                event_id = str(event.get("client_event_id", "")).strip()
+            batch = conn.execute("SELECT * FROM offline_batches WHERE client_batch_id=?", (batch_id,)).fetchone()
+            created = False
+            if batch is None:
+                cur = conn.execute(
+                    "INSERT INTO offline_batches(client_batch_id,actor,status,received_at,summary) VALUES(?,?,?,?,?)",
+                    (batch_id, actor, "received", now, json_dump({"accepted": 0, "rejected": 0, "pending": 0})),
+                )
+                batch_row_id = int(cur.lastrowid)
+                created = True
+            else:
+                batch_row_id = batch["id"]
+            changed = created
+            written: set[int] = set()
+            for index, raw_event in enumerate(events):
+                event = raw_event if isinstance(raw_event, dict) else {}
+                event_id = str(event.get("client_event_id", "")).strip() or "#missing-id-%d" % (index + 1)
+                receipt = conn.execute(
+                    "SELECT * FROM offline_records WHERE batch_id=? AND client_event_id=?",
+                    (batch_row_id, event_id),
+                ).fetchone()
+                if receipt and receipt["status"] == "merged":
+                    continue  # 已成功记录重传不重复写入
+                if receipt and receipt["status"] == "pending":
+                    continue  # 复查中的记录由复查流程处理
+                receipt_id = receipt["id"] if receipt else None
                 try:
-                    if not event_id:
-                        raise DomainError("离线事件缺少 client_event_id")
-                    if event.get("type") == "clue":
-                        existing_clue = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
-                        if existing_clue:
-                            results.append({"client_event_id": event_id, "status": "merged", "record_id": existing_clue["id"], "idempotent": True})
-                            continue
-                        incident_id = int(event["incident_id"])
-                        lat, lon = validate_position(event["latitude"], event["longitude"])
-                        confidence = float(event["confidence"])
-                        if not 0 <= confidence <= 1:
-                            raise DomainError("置信度应在 0 到 1 之间")
-                        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
-                        if not incident:
-                            raise DomainError("事件不存在", 404)
-                        if incident["status"] in CLOSED_INCIDENT:
-                            raise DomainError("已结束事件不能新增线索", 409)
-                        area_id = event.get("area_id")
-                        if area_id is not None and not conn.execute(
-                            "SELECT 1 FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)
-                        ).fetchone():
-                            raise DomainError("搜索区域不属于该事件", 409)
-                        distance = haversine_km(incident["latitude"], incident["longitude"], lat, lon)
-                        status = "unverified" if distance <= incident["uncertainty_km"] * 3 else "invalid"
-                        cur = conn.execute(
-                            """INSERT INTO clues(incident_id,area_id,client_event_id,latitude,longitude,confidence,source,status,
-                               distance_from_incident_km,reporter,details,recorded_at)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (incident_id, area_id, event_id, lat, lon, confidence,
-                             str(event.get("source", "offline")).strip(), status, distance, actor,
-                             str(event.get("details", "")).strip(), utcnow()),
-                        )
-                        self._audit(conn, incident_id, actor, "clue.recorded", {"clue_id": cur.lastrowid, "status": status, "event_id": event_id})
-                        results.append({"client_event_id": event_id, "status": "merged", "record_id": cur.lastrowid})
-                    elif event.get("type") == "timeline":
-                        incident_id = int(event["incident_id"])
-                        if not conn.execute("SELECT 1 FROM incidents WHERE id=?", (incident_id,)).fetchone():
-                            raise DomainError("事件不存在", 404)
-                        self._audit(conn, incident_id, actor, event.get("action", "offline.note"), event.get("details", {}))
-                        results.append({"client_event_id": event_id, "status": "merged", "record_id": None})
-                    else:
-                        raise DomainError("不支持的离线事件类型")
-                except (DomainError, KeyError, TypeError, ValueError) as exc:
-                    results.append({"client_event_id": event_id, "status": "rejected", "error": str(exc)})
-            summary = {"accepted": sum(1 for item in results if item["status"] == "merged"), "rejected": sum(1 for item in results if item["status"] == "rejected"), "events": results}
-            now = utcnow()
+                    etype, record_id, wrote = self._merge_offline_event(conn, actor, event, event_id)
+                    receipt_id = self._save_receipt(conn, batch_row_id, event_id, etype, event, "merged", record_id, "", receipt_id)
+                    if wrote:
+                        written.add(receipt_id)
+                except DomainError as exc:
+                    self._save_receipt(conn, batch_row_id, event_id, str(event.get("type", "")), event, "rejected", None, str(exc), receipt_id)
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._save_receipt(conn, batch_row_id, event_id, str(event.get("type", "")), event, "rejected", None, "离线事件字段无效: %s" % exc, receipt_id)
+                changed = True
+            status, summary, receipts = self._refresh_batch(conn, batch_row_id)
+            if changed:
+                self._audit(conn, None, actor, "offline.batch_merged", {"batch_id": batch_id, **summary})
+            results = [
+                {
+                    "receipt_id": r["id"],
+                    "client_event_id": r["client_event_id"],
+                    "type": r["event_type"],
+                    "status": r["status"],
+                    "record_id": r["record_id"],
+                    "error": r["error"],
+                    "idempotent": r["status"] == "merged" and r["id"] not in written,
+                }
+                for r in receipts
+            ]
+            return {"batch_id": batch_id, "idempotent": not changed, "status": status,
+                    "summary": {**summary, "events": results}}
+
+    def _payload_incident(self, conn: sqlite3.Connection, record: sqlite3.Row) -> sqlite3.Row | None:
+        try:
+            payload = json.loads(record["payload"])
+            incident_id = int(payload["incident_id"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+        return conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+
+    def request_offline_review(self, actor: str, role: str, record_id: int, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"operator", "field", "coordinator"}, "发起离线记录复查")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = conn.execute("SELECT * FROM offline_records WHERE id=?", (record_id,)).fetchone()
+            if not record:
+                raise DomainError("离线回执不存在", 404)
+            if record["status"] != "rejected":
+                raise DomainError("只有被拒绝的记录可以发起复查", 409)
+            incident = self._payload_incident(conn, record)
+            if incident and incident["status"] in CLOSED_INCIDENT:
+                raise DomainError("事件已结束，只保留拒绝原因，不能复查", 409)
             conn.execute(
-                "INSERT INTO offline_batches(client_batch_id,actor,status,received_at,merged_at,summary) VALUES(?,?,?,?,?,?)",
-                (batch_id, actor, "merged", now, now, json_dump(summary)),
+                "UPDATE offline_records SET status='pending',review_note=?,updated_at=? WHERE id=?",
+                (note.strip(), utcnow(), record_id),
             )
-            self._audit(conn, None, actor, "offline.batch_merged", {"batch_id": batch_id, **{k: summary[k] for k in ("accepted", "rejected")}})
-            return {"batch_id": batch_id, "idempotent": False, "status": "merged", "summary": summary}
+            self._refresh_batch(conn, record["batch_id"])
+            self._audit(conn, None, actor, "offline.review_requested",
+                        {"record_id": record_id, "client_event_id": record["client_event_id"], "note": note.strip()})
+            return dict(conn.execute("SELECT * FROM offline_records WHERE id=?", (record_id,)).fetchone())
+
+    def resolve_offline_review(self, actor: str, role: str, record_id: int, decision: str,
+                               corrections: dict[str, Any] | None = None, reason: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "analyst"}, "处理离线记录复查")
+        if decision not in {"merge", "reject"}:
+            raise DomainError("复查结论无效")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = conn.execute("SELECT * FROM offline_records WHERE id=?", (record_id,)).fetchone()
+            if not record:
+                raise DomainError("离线回执不存在", 404)
+            if record["status"] != "pending":
+                raise DomainError("记录不在复查中", 409)
+            try:
+                payload = json.loads(record["payload"])
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(corrections, dict):
+                payload.update(corrections)
+            if decision == "merge":
+                try:
+                    etype, merged_id, _wrote = self._merge_offline_event(conn, actor, payload, record["client_event_id"])
+                    self._save_receipt(conn, record["batch_id"], record["client_event_id"], etype, payload, "merged", merged_id, "", record_id)
+                except DomainError as exc:
+                    self._save_receipt(conn, record["batch_id"], record["client_event_id"], str(payload.get("type", "")), payload, "rejected", None, str(exc), record_id)
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._save_receipt(conn, record["batch_id"], record["client_event_id"], str(payload.get("type", "")), payload, "rejected", None, "离线事件字段无效: %s" % exc, record_id)
+            else:
+                self._save_receipt(conn, record["batch_id"], record["client_event_id"], record["event_type"], payload,
+                                   "rejected", None, reason.strip() or record["error"] or "复查维持拒绝", record_id)
+            self._refresh_batch(conn, record["batch_id"])
+            self._audit(conn, None, actor, "offline.review_resolved",
+                        {"record_id": record_id, "client_event_id": record["client_event_id"], "decision": decision})
+            return dict(conn.execute("SELECT * FROM offline_records WHERE id=?", (record_id,)).fetchone())
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -555,7 +736,19 @@ class MaritimeSARService:
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+            batches = [dict(r) for r in conn.execute("SELECT * FROM offline_batches ORDER BY id DESC LIMIT 100").fetchall()]
+            counts = conn.execute("SELECT batch_id,status,COUNT(*) AS c FROM offline_records GROUP BY batch_id,status").fetchall()
+            by_batch: dict[int, dict[str, int]] = {}
+            for row in counts:
+                by_batch.setdefault(row["batch_id"], {})[row["status"]] = row["c"]
+            for batch in batches:
+                tally = by_batch.get(batch["id"], {})
+                batch["pending"] = tally.get("pending", 0)
+                batch["merged"] = tally.get("merged", 0)
+                batch["rejected"] = tally.get("rejected", 0)
+            records = [dict(r) for r in conn.execute("SELECT * FROM offline_records ORDER BY id DESC LIMIT 300").fetchall()]
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "timeline": timeline, "offline_batches": batches, "offline_records": records}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -655,6 +848,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.close_incident(actor, role, **data)
             elif path == "/api/offline/batch":
                 result = self.service.merge_offline_batch(actor, role, **data)
+            elif path == "/api/offline/review":
+                result = self.service.request_offline_review(actor, role, **data)
+            elif path == "/api/offline/review/resolve":
+                result = self.service.resolve_offline_review(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

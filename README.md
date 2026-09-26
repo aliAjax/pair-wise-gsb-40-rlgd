@@ -25,8 +25,12 @@ python3 app.py
 - `POST /api/clues`、`POST /api/clues/verify`
 - `POST /api/assets/withdraw`：撤回资源并释放任务
 - `POST /api/incidents/transfer`、`POST /api/incidents/close`
-- `POST /api/offline/batch`：幂等合并离线记录
+- `POST /api/offline/batch`：逐条回执合并离线记录。每条记录独立落回执（成功/拒绝/待处理）；已成功记录重传不重复写入，被拒记录改正后随批次重传可再合并；事件结束后只保留拒绝原因，时间线不再改动
+- `POST /api/offline/review`：对被拒记录发起复查（转入待处理）
+- `POST /api/offline/review/resolve`：协调员/分析员处理复查，可带修正字段合并或维持拒绝
 - `GET /api/incidents/{id}/timeline`
+
+`GET /api/state` 同时返回 `offline_batches`（按批次的待处理/成功/拒绝数量）和 `offline_records`（逐条回执），页面据此展示批次并支持从拒绝记录发起复查。
 
 ## 测试
 
@@ -34,7 +38,7 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整协调流程、重复报警、错误位置、资源并发占用、离线幂等和权限拒绝。
+测试覆盖完整协调流程、重复报警、错误位置、资源并发占用、离线逐条回执与重传幂等、复查流程、事件结束后时间线冻结和权限拒绝。
 
 ## 局限
 
